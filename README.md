@@ -12,13 +12,37 @@ browse fonts on host media, or upload one from the custom Editor page. It uses
 - Device UI:
   - **SOUND** — instrument list, preset selection, volume, octave and transpose.
   - **FILES** — media browser for `.sf2` files, drag & drop support on plugin/browser hosts.
-  - **CTRL** — parameter page.
+  - **CTRL** — three pages (F1 / F2): sound, FX 1 and FX 2; knobs 1-4 edit the four shown values.
   - **HELP** — HOME / F5 overview of every control.
-  - F1 PREV, F2 NEXT, F3 AUDITION, F4 FILES, F5 HELP, F6 ALL OFF.
+  - F1 PREV, F2 NEXT (on CTRL: previous / next page), F3 AUDITION, F4 FILES / SOUND,
+    F5 HELP, F6 ALL OFF.
   - K1 SOUND, K2 FILES, K3 CTRL, K4 AUDITION, K5 HELP, K6 ALL OFF.
   - Hold ENTER or DATA to turn on FOCUS; DATA then walks the on-screen controls.
 - Editor page with `.sf2` upload, a preset dropdown, media-path loading and audition buttons.
-- Four automatable parameters: `preset`, `volume`, `octave`, `transpose`.
+- Twelve automatable parameters: `preset`, `volume`, `octave`, `transpose` and eight master FX controls.
+
+## Master effects
+
+A global effect chain runs after TinySoundFont (or the fallback demo voice) and before the final
+soft clip, so it affects every preset. TinySoundFont does not implement SF2 chorus/reverb sends;
+these are the firmware's own master effects.
+
+Signal order: **drive -> chorus -> ping-pong delay -> stereo reverb -> tone -> tremolo**.
+
+| Parameter | Default | What it does |
+| --- | --- | --- |
+| `drive` | 0 | Pre-gain into the final soft clipper (saturation). |
+| `chorus` | 0.25 | Two LFO-modulated delay taps, one per channel. |
+| `delay` | 0 | Wet level of a 375 ms cross-fed echo. |
+| `feedback` | 0.35 | Echo repeats (scaled to a maximum of 0.85 to stay stable). |
+| `reverb` | 0.32 | Wet level of a 4-comb / 2-allpass room per channel. |
+| `decay` | 0.50 | Reverb feedback and damping (room length / brightness). |
+| `tremolo` | 0 | LFO amplitude modulation, slightly offset between L and R. |
+| `tone` | 1.00 | State-variable low-pass, 500 Hz ... 18 kHz (1 = open). |
+
+All eight are normalised 0..1 parameters, available as named DAW parameters, sliders in the Editor,
+and rows on the device's CTRL pages 2 and 3. The effects live in `firmware/sf2-player/fx.c` and use
+static delay lines; nothing is allocated at run time.
 
 ## Build
 
@@ -44,6 +68,7 @@ node sdk/tools/vibe-check.mjs sdk/build/sf2-player.wasm \
 - Maximum SoundFont size: **16 MB**. The file buffer and the two font arenas are static;
   the firmware uses no heap and no libc.
 - Up to 256 presets and 64 simultaneous voices per font.
+- The master FX chain adds about 280 KB of static delay-line memory and runs entirely in the audio flow.
 - TinySoundFont is vendored unchanged in `firmware/sf2-player/vendor/tsf.h` (MIT license in
   `vendor/LICENSE.tsf`). `tsf_config.h` redirects its allocator and maths to static arenas and
   Vibe SDK DSP helpers; `tsf_port.c` is the only translation unit with `TSF_IMPLEMENTATION`.

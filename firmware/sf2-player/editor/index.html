@@ -26,6 +26,8 @@
   .ctl { display: grid; grid-template-columns: 110px 1fr 70px; align-items: center; gap: 8px; }
   .ctl input[type=range] { width: 100%; accent-color: var(--vibe-accent, #f0a64a); }
   .ctl span:last-child { text-align: right; color: var(--vibe-muted, #8b95a7); font-variant-numeric: tabular-nums; }
+  .subhead { grid-column: 1 / -1; margin: 10px 0 0; font-size: 11px; letter-spacing: .12em;
+             text-transform: uppercase; color: var(--vibe-accent, #f0a64a); }
   #status { margin-top: 12px; min-height: 20px; color: var(--vibe-accent, #f0a64a); }
   #progress { color: var(--vibe-muted, #8b95a7); }
   #presets { min-width: 320px; flex: 1; }
@@ -35,7 +37,8 @@
 <body>
 <h1>SF2 PLAYER</h1>
 <p class="lead">Load a SoundFont, pick a preset, and play it from the keys, pads, MIDI or the DAW.
-   The same instrument is available in the device's SOUND and FILES pages.</p>
+   Every parameter below is automatable in the DAW, including the master effects (drive, chorus,
+   delay, reverb, tremolo and tone). On the device, F1 / F2 page through them on the CTRL tab.</p>
 
 <h2>Sound</h2>
 <div class="panel">
@@ -92,7 +95,15 @@
     return out;
   };
 
+  let fxHeading = false;
   for (const p of vibe.params) {
+    if (!fxHeading && p.group === 'FX') {
+      const h = document.createElement('div');
+      h.className = 'subhead';
+      h.textContent = 'Master effects';
+      paramsEl.append(h);
+      fxHeading = true;
+    }
     const row = document.createElement('div');
     row.className = 'ctl';
     const name = document.createElement('span');

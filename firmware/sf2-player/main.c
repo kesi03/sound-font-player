@@ -12,6 +12,7 @@
 #include "tsf_config.h"
 #include "vendor/tsf.h"
 #include "tsf_port.h"
+#include "fx.h"
 
 VIBE_PARALLEL_AUDIO
 
@@ -31,7 +32,12 @@ enum { UI_SOUND, UI_FILES, UI_CTRL, UI_HELP };
 enum { LOAD_IDLE, LOAD_STAT, LOAD_READ };
 enum { UP_IDLE, UP_DATA };
 enum { MSG_ON = 1, MSG_OFF = 2, MSG_ALL = 3, MSG_AUDITION = 4 };
-enum { P_PRESET, P_VOLUME, P_OCTAVE, P_TRANSPOSE, P_COUNT };
+enum {
+  P_PRESET, P_VOLUME, P_OCTAVE, P_TRANSPOSE,
+  P_DRIVE, P_CHORUS, P_DELAY, P_FEEDBACK,
+  P_REVERB, P_DECAY, P_TREMOLO, P_TONE,
+  P_COUNT
+};
 
 #define C_BG     0x0B0F17
 #define C_PANEL  0x151C2A
@@ -44,12 +50,29 @@ enum { P_PRESET, P_VOLUME, P_OCTAVE, P_TRANSPOSE, P_COUNT };
 #define C_RED    0xFF6B6B
 #define C_BLUE   0x5AB6FF
 
-static const char *const GROUPS[] = { "SOUND", "SOUND", "SOUND", "SOUND" };
+static const char *const GROUPS[] = {
+  "SOUND", "SOUND", "SOUND", "SOUND",
+  "FX", "FX", "FX", "FX", "FX", "FX", "FX", "FX"
+};
 static const vibe_param PARAMS[] = {
   { "preset", "Preset", 0.0f, 255.0f, 0.0f, "", 0, 0 },
   { "volume", "Volume", 0.0f, 2.0f, 1.0f, "", 0, 0 },
   { "octave", "Octave", -2.0f, 2.0f, 0.0f, "", 5, 0 },
-  { "transpose", "Transpose", -24.0f, 24.0f, 0.0f, "st", 0, 0 }
+  { "transpose", "Transpose", -24.0f, 24.0f, 0.0f, "st", 0, 0 },
+  { "drive", "Drive", 0.0f, 1.0f, 0.0f, "", 0, 0 },
+  { "chorus", "Chorus", 0.0f, 1.0f, 0.25f, "", 0, 0 },
+  { "delay", "Delay", 0.0f, 1.0f, 0.0f, "", 0, 0 },
+  { "feedback", "Feedback", 0.0f, 1.0f, 0.35f, "", 0, 0 },
+  { "reverb", "Reverb", 0.0f, 1.0f, 0.32f, "", 0, 0 },
+  { "decay", "Decay", 0.0f, 1.0f, 0.50f, "", 0, 0 },
+  { "tremolo", "Tremolo", 0.0f, 1.0f, 0.0f, "", 0, 0 },
+  { "tone", "Tone", 0.0f, 1.0f, 1.0f, "", 0, 0 }
+};
+
+static const char *const P_LABELS[P_COUNT] = {
+  "PRESET", "VOLUME", "OCTAVE", "TRANSPOSE",
+  "DRIVE", "CHORUS", "DELAY", "FEEDBACK",
+  "REVERB", "DECAY", "TREMOLO", "TONE"
 };
 
 static const char *const HELP[] = {
@@ -57,7 +80,9 @@ static const char *const HELP[] = {
   "ENTER", "audition / open a file", "F1 / F2", "previous / next preset",
   "F3", "audition middle C", "F4", "toggle SOUND / FILES",
   "F5 / K5", "this overview", "F6 / K6", "all notes off",
-  "K1-K3", "SOUND / FILES / CTRL pages", "KNOBS 1-4", "preset / volume / octave / transpose",
+  "K1-K3", "SOUND / FILES / CTRL pages", "KNOBS 1-4", "values on the SOUND page",
+  "CTRL F1/F2", "switch 3 pages: sound, FX 1, FX 2", "CTRL KNOBS", "edit the 4 shown values",
+  "FX 1", "drive / chorus / delay / feedback", "FX 2", "reverb / decay / tremolo / tone",
   "HOLD ENTER", "turn on FOCUS, DATA walks controls", "RETURN", "back / FOCUS off",
   "HOME", "this overview", "EDITOR", "upload .sf2 and pick a preset",
   "SPEED", "two static 16 MB font banks"
@@ -75,6 +100,7 @@ static int g_preset_req;
 static int g_volume_i = 1000;
 static int g_octave_i;
 static int g_transpose_i;
+static int g_fx_i[FX_COUNT] = { 0, 250, 0, 350, 320, 500, 0, 1000 };
 
 typedef struct { uint8_t type, note, vel, pad; } note_msg;
 static note_msg note_q[SF_NOTE_QUEUE];
@@ -85,6 +111,7 @@ static float render_buf[VIBE_MAX_BLOCK * 2];
 
 /* Control-flow-only state. */
 static int ui_page = UI_SOUND, help;
+static int ctrl_page;
 static int sel_preset, top_preset, sel_file, top_file;
 static int npresets;
 static char status[128];
@@ -341,6 +368,12 @@ static void apply_param(int id, float value)
       g_transpose_i = n;
       break;
     default:
+      if (id >= P_DRIVE && id < P_COUNT) {
+        n = (int)(value * 1000.0f + 0.5f);
+        if (n < 0) n = 0;
+        if (n > 1000) n = 1000;
+        __atomic_store_n(&g_fx_i[id - P_DRIVE], n, __ATOMIC_RELEASE);
+      }
       break;
   }
 }
@@ -356,12 +389,25 @@ static void change_param(int id, float delta)
   apply_param(id, v);
 }
 
+/* Continuous values move in fine steps, note values one at a time. */
+static void tweak_param(int id, float dir)
+{
+  float step = (id == P_VOLUME || id >= P_DRIVE) ? 0.05f : 1.0f;
+  float v;
+  if (id != P_PRESET) { change_param(id, step * dir); return; }
+  v = vibe_param_get(id) + step * dir;
+  if (v > PARAMS[id].max) v = PARAMS[id].min;
+  if (v < PARAMS[id].min) v = PARAMS[id].max;
+  vibe_param_set(id, v);
+  apply_param(id, v);
+}
+
 static void set_page(int page)
 {
   static const char *const K[] = { "SOUND", "FILES", "CTRL", "AUDITION", "HELP", "ALL OFF" };
   static const char *const F_SOUND[] = { "PREV", "NEXT", "AUDIT", "FILES", "HELP", "ALL OFF" };
   static const char *const F_FILES[] = { "BACK", "OPEN", "AUDIT", "SOUND", "HELP", "ALL OFF" };
-  static const char *const F_CTRL[]  = { "PREV", "NEXT", "AUDIT", "FILES", "HELP", "ALL OFF" };
+  static const char *const F_CTRL[]  = { "PAGE-", "PAGE+", "AUDIT", "SOUND", "HELP", "ALL OFF" };
   static const char *const F_HELP[]  = { "SOUND", "FILES", "CTRL", "AUDIT", "CLOSE", "ALL OFF" };
   const char *const *f = F_SOUND;
   int i;
@@ -872,14 +918,19 @@ static void handle_button(const vibe_event *e)
       case 0:
         if (help) set_page(UI_SOUND);
         else if (ui_page == UI_FILES) browser_up();
+        else if (ui_page == UI_CTRL) ctrl_page = (ctrl_page + 2) % 3;
         else move_sel(-1);
         break;
       case 1:
         if (ui_page == UI_FILES) open_sel();
+        else if (ui_page == UI_CTRL) ctrl_page = (ctrl_page + 1) % 3;
         else move_sel(1);
         break;
       case 2: audition(); break;
-      case 3: set_page(ui_page == UI_FILES ? UI_SOUND : UI_FILES); break;
+      case 3:
+        if (ui_page == UI_CTRL) set_page(UI_SOUND);
+        else set_page(ui_page == UI_FILES ? UI_SOUND : UI_FILES);
+        break;
       case 4: set_page(UI_HELP); break;
       case 5: all_off(); break;
     }
@@ -925,11 +976,8 @@ static void handle_focus_press(int id)
   } else if (id == 90) move_sel(-1);
   else if (id == 91) move_sel(1);
   else if (id >= 300 && id < 304) {
-    int p = P_PRESET + (id - 300);
-    float v = vibe_param_get(p) + (p == P_VOLUME ? 0.1f : 1.0f);
-    if (v > PARAMS[p].max) v = PARAMS[p].min;
-    vibe_param_set(p, v);
-    apply_param(p, v);
+    int p = (ui_page == UI_CTRL ? ctrl_page * 4 : 0) + (id - 300);
+    if (p < P_COUNT) tweak_param(p, 1.0f);
   }
 }
 
@@ -969,6 +1017,10 @@ void vibe_on_event(const vibe_event *e)
   }
   if (e->type == VIBE_EV_BUTTON) { handle_button(e); return; }
   if (e->type == VIBE_EV_ENCODER) {
+    if (ui_page == UI_CTRL && e->id >= VE_1 && e->id <= VE_4) {
+      tweak_param(ctrl_page * 4 + (e->id - VE_1), e->value);
+      return;
+    }
     switch (e->id) {
       case VE_1: move_sel(e->value > 0 ? 1 : -1); break;
       case VE_2: change_param(P_VOLUME, e->value * 0.05f); break;
@@ -1065,6 +1117,16 @@ static void process_messages(void)
   }
 }
 
+/* Keep non-finite or extreme synth samples out of the FX feedback lines:
+   an infinity there would turn into NaN on the next subtract. */
+static float safe_sample(float x)
+{
+  if (x != x) return 0.0f;
+  if (x > 8.0f) return 8.0f;
+  if (x < -8.0f) return -8.0f;
+  return x;
+}
+
 static float output_sample(float x)
 {
   float y = vd_tanh(x);
@@ -1077,6 +1139,7 @@ void vibe_on_audio(const float *in, float *out_l, float *out_r, int frames)
 {
   tsf *f;
   int preset, vol, i, n;
+  int fxv[FX_COUNT];
   float gain;
 
   (void)in;
@@ -1096,6 +1159,8 @@ void vibe_on_audio(const float *in, float *out_l, float *out_r, int frames)
   vol = __atomic_load_n(&g_volume_i, __ATOMIC_ACQUIRE);
   if (vol != cur_vol) cur_vol = vol;
   gain = (float)vol * 0.001f;
+  for (i = 0; i < FX_COUNT; i++)
+    fxv[i] = __atomic_load_n(&g_fx_i[i], __ATOMIC_ACQUIRE);
 
   process_messages();
 
@@ -1113,8 +1178,8 @@ void vibe_on_audio(const float *in, float *out_l, float *out_r, int frames)
   if (f) {
     tsf_render_float(f, render_buf, frames, 0);
     for (i = 0; i < frames; i++) {
-      out_l[i] = output_sample(render_buf[i * 2] * gain);
-      out_r[i] = output_sample(render_buf[i * 2 + 1] * gain);
+      out_l[i] = safe_sample(render_buf[i * 2] * gain);
+      out_r[i] = safe_sample(render_buf[i * 2 + 1] * gain);
     }
   } else {
     for (i = 0; i < frames; i++) {
@@ -1132,8 +1197,14 @@ void vibe_on_audio(const float *in, float *out_l, float *out_r, int frames)
         if (d->phase >= 1.0f) d->phase -= 1.0f;
         s += (vd_sin(d->phase) * 0.8f + vd_sin(d->phase * 2.0f) * 0.2f) * d->env;
       }
-      out_l[i] = out_r[i] = output_sample(s * gain);
+      out_l[i] = out_r[i] = safe_sample(s * gain);
     }
+  }
+
+  fx_process(out_l, out_r, frames, fxv);
+  for (i = 0; i < frames; i++) {
+    out_l[i] = output_sample(out_l[i]);
+    out_r[i] = output_sample(out_r[i]);
   }
 }
 
@@ -1241,25 +1312,26 @@ static void draw_ctrl_page(void)
 {
   char t[32];
   int i;
-  vg_text("CONTROL", 12, 42, VG_BOLD, C_MUTED, VG_LEFT);
+  vg_text(ctrl_page == 0 ? "CONTROL" : "EFFECTS", 12, 42, VG_BOLD, C_MUTED, VG_LEFT);
   vg_round(8, 64, 464, 48, 6, C_PANEL);
-  vg_text("SOUNDFONT", 20, 70, VG_SMALL, C_MUTED, VG_LEFT);
+  vg_text(ctrl_page == 0 ? "SOUNDFONT" : "MASTER CHAIN", 20, 70, VG_SMALL, C_MUTED, VG_LEFT);
   vg_text(font_name[0] ? font_name : "(none - demo voice)", 20, 86, VG_BIG, C_ACC, VG_LEFT);
-  vg_text(vg_itoa(npresets, t), 462, 86, VG_MED, C_FG, VG_RIGHT);
+  t[0] = (char)('1' + ctrl_page); t[1] = '/'; t[2] = '3'; t[3] = 0;
+  vg_text(t, 462, 74, VG_MED, C_FG, VG_RIGHT);
 
   for (i = 0; i < 4; i++) {
     int y = 124 + i * 38;
-    const char *label = i == 0 ? "PRESET" : i == 1 ? "VOLUME" : i == 2 ? "OCTAVE" : "TRANSPOSE";
-    const char *value = i == 0 ? vg_itoa(sel_preset, t) :
-                        i == 1 ? vg_ftoa(vibe_param_get(P_VOLUME), 2, t) :
-                        i == 2 ? vg_itoa(g_octave_i, t) : vg_itoa(g_transpose_i, t);
+    int id = ctrl_page * 4 + i;
+    float v = vibe_param_get(id);
+    const char *value = id <= P_TRANSPOSE ? vg_itoa((int)(v + 0.5f), t) : vg_ftoa(v, 2, t);
     vg_round(8, y, 464, 32, 5, C_PANEL2);
-    vg_text(label, 20, y + 8, VG_BOLD, C_MUTED, VG_LEFT);
+    vg_text(P_LABELS[id], 20, y + 8, VG_BOLD, C_MUTED, VG_LEFT);
     vg_text(value, 460, y + 5, VG_BIG, C_FG, VG_RIGHT);
     vf_encoder(VE_1 + i, 8, y, 464, 32);
   }
+  vg_text("F1 / F2 switch pages - knobs edit the four shown values", 12, 270, VG_SMALL, C_DIM, VG_LEFT);
   vg_text(status, 12, 284, VG_SMALL, C_GREEN, VG_LEFT);
-  draw_softkeys((const char *const[]){ "PREV", "NEXT", "AUDIT", "FILES", "HELP", "ALL OFF" });
+  draw_softkeys((const char *const[]){ "PAGE-", "PAGE+", "AUDIT", "SOUND", "HELP", "ALL OFF" });
 }
 
 void vibe_on_draw(uint16_t *fb)
@@ -1288,10 +1360,20 @@ void vibe_on_init(float sample_rate)
   int pad, x, y;
 
   sr = sample_rate > 0.0f ? sample_rate : 48000.0f;
+  fx_init(sr);
+  ctrl_page = 0;
   vibe_notes(VIBE_NOTES | VIBE_NOTES_PADS | VIBE_NOTES_OWN_OCTAVE);
   vibe_keys_octave(2);
   vibe_params(PARAMS, P_COUNT);
   vibe_param_groups(GROUPS);
+  vibe_param_help(P_DRIVE, "Pre-gain into the final soft clipper (saturation).");
+  vibe_param_help(P_CHORUS, "Wet level of the stereo modulated chorus.");
+  vibe_param_help(P_DELAY, "Wet level of the 375 ms ping-pong echo.");
+  vibe_param_help(P_FEEDBACK, "Echo feedback, capped at 0.85.");
+  vibe_param_help(P_REVERB, "Wet level of the stereo room reverb.");
+  vibe_param_help(P_DECAY, "Reverb decay and damping: short/bright to long/dark.");
+  vibe_param_help(P_TREMOLO, "LFO amplitude depth (about 5.4 Hz).");
+  vibe_param_help(P_TONE, "Master low-pass cutoff, 500 Hz to 18 kHz (1 = open).");
   vibe_editor_accent(C_ACC);
   vibe_editor_control(P_PRESET, VIBE_CTL_MENU);
   vf_mode(VF_ON_HOLD);
