@@ -46,7 +46,7 @@ static delay lines; nothing is allocated at run time.
 
 ## Build
 
-The build needs Zig 0.13.0. The Vibe SDK is pinned to the same commit used by naminator.
+The build needs Zig 0.13.0. The Vibe SDK is pinned latest version.
 
 ```sh
 sh scripts/fetch-sdk.sh
