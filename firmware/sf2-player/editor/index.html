@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SF2 PLAYER</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px; background: var(--vibe-bg, #0b0f17); color: var(--vibe-fg, #e9eef7);
+         font: 13px/1.45 var(--vibe-font, system-ui, sans-serif); }
+  h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: .08em; color: var(--vibe-accent, #f0a64a); }
+  h2 { margin: 18px 0 8px; font-size: 12px; letter-spacing: .12em; color: var(--vibe-muted, #8b95a7); text-transform: uppercase; }
+  .lead { margin: 0 0 14px; color: var(--vibe-muted, #8b95a7); }
+  .panel { border: 1px solid var(--vibe-line, #374151); border-radius: 8px; padding: 12px; margin-top: 10px;
+           background: color-mix(in srgb, var(--vibe-bg, #0b0f17) 82%, #000); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button, select, input[type=text] { padding: 7px 9px; border: 1px solid var(--vibe-line, #374151); border-radius: 6px;
+    background: #111827; color: var(--vibe-fg, #e9eef7); font: inherit; }
+  button { cursor: pointer; border-color: var(--vibe-accent, #f0a64a); }
+  button:disabled { opacity: .5; cursor: default; }
+  label.file { display: inline-block; padding: 7px 9px; border: 1px solid var(--vibe-accent, #f0a64a);
+               border-radius: 6px; cursor: pointer; }
+  label.file input { display: none; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px 18px; }
+  .ctl { display: grid; grid-template-columns: 110px 1fr 70px; align-items: center; gap: 8px; }
+  .ctl input[type=range] { width: 100%; accent-color: var(--vibe-accent, #f0a64a); }
+  .ctl span:last-child { text-align: right; color: var(--vibe-muted, #8b95a7); font-variant-numeric: tabular-nums; }
+  #status { margin-top: 12px; min-height: 20px; color: var(--vibe-accent, #f0a64a); }
+  #progress { color: var(--vibe-muted, #8b95a7); }
+  #presets { min-width: 320px; flex: 1; }
+  code { color: #6ee7a8; }
+</style>
+</head>
+<body>
+<h1>SF2 PLAYER</h1>
+<p class="lead">Load a SoundFont, pick a preset, and play it from the keys, pads, MIDI or the DAW.
+   The same instrument is available in the device's SOUND and FILES pages.</p>
+
+<h2>Sound</h2>
+<div class="panel">
+  <div class="row">
+    <select id="presets" aria-label="Preset"><option value="0">(no preset loaded)</option></select>
+    <button id="audition">AUDITION C4</button>
+    <button id="alloff">ALL NOTES OFF</button>
+  </div>
+  <div class="grid" id="params" style="margin-top:12px"></div>
+</div>
+
+<h2>SoundFont</h2>
+<div class="panel">
+  <div class="row">
+    <label class="file">Upload .sf2<input type="file" id="font" accept=".sf2,audio/midi,application/octet-stream"></label>
+    <button id="refresh">REFRESH</button>
+  </div>
+  <p id="progress">Fonts are parsed into one of two static 16 MB banks. The maximum file size is 16 MB.
+     Uploads live in RAM; keep the .sf2 on media to reload it after a restart.</p>
+  <div class="row">
+    <input type="text" id="path" placeholder="sd/sounds/piano.sf2 or usb/fonts/band.sf2">
+    <button id="load">LOAD FROM MEDIA</button>
+  </div>
+  <p class="lead">Media paths start with a source key shown in the device's FILES page. On the VIBE, fonts on the
+     card or a USB stick appear there automatically; in the browser or plugin you can also drop an .sf2 onto the window.</p>
+</div>
+
+<div id="status"></div>
+
+<script src="vibe-editor.js"></script>
+<script>
+(async () => {
+  await vibe.ready;
+  const $ = (id) => document.getElementById(id);
+  const dec = new TextDecoder();
+  const enc = new TextEncoder();
+  const paramsEl = $('params'), presetsEl = $('presets'), statusEl = $('status'), progressEl = $('progress');
+  const controls = [];
+  const presetParam = vibe.params.find((p) => p.id === 'preset');
+  let lastStatus = '';
+  let selected = 0;
+
+  const le32 = (v) => {
+    const a = new Uint8Array(4);
+    new DataView(a.buffer).setUint32(0, v >>> 0, true);
+    return a;
+  };
+  const msg = (...parts) => {
+    let n = 0;
+    for (const p of parts) n += p.length;
+    const out = new Uint8Array(n);
+    let k = 0;
+    for (const p of parts) { out.set(p, k); k += p.length; }
+    return out;
+  };
+
+  for (const p of vibe.params) {
+    const row = document.createElement('div');
+    row.className = 'ctl';
+    const name = document.createElement('span');
+    name.textContent = p.name;
+    const input = document.createElement('input');
+    input.type = 'range';
+    input.min = '0'; input.max = '1000'; input.step = '1';
+    const val = document.createElement('span');
+    input.oninput = () => vibe.set(p.i, p.min + (+input.value) / 1000 * (p.max - p.min));
+    row.append(name, input, val);
+    paramsEl.append(row);
+    controls.push({ p, input, val });
+  }
+
+  vibe.onValues((values) => {
+    for (const { p, input, val } of controls) {
+      const v = values[p.i], norm = (v - p.min) / (p.max - p.min || 1);
+      if (document.activeElement !== input) input.value = String(Math.round(norm * 1000));
+      const digits = p.id === 'volume' ? 2 : 0;
+      val.textContent = v.toFixed(digits) + (p.unit ? ' ' + p.unit : '');
+    }
+    if (presetParam && document.activeElement !== presetsEl) {
+      const v = Math.round(values[presetParam.i]);
+      if (v >= 0 && v < presetsEl.options.length) {
+        selected = v;
+        presetsEl.value = String(v);
+      }
+    }
+  });
+
+  vibe.onData((b) => {
+    if (!b.length || b[0] !== 2) return;
+    const lines = dec.decode(b.subarray(1)).split('\n');
+    lastStatus = lines[0] || '';
+    statusEl.textContent = lastStatus;
+    let fontLine = '(none)';
+    const items = [];
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line) continue;
+      if (line.startsWith('FONT:')) { fontLine = line.slice(5); continue; }
+      const colon = line.indexOf(':');
+      if (colon > 0) items.push([line.slice(0, colon), line.slice(colon + 1)]);
+    }
+    progressEl.textContent = 'Font: ' + fontLine;
+    const keep = document.activeElement === presetsEl ? presetsEl.value : null;
+    presetsEl.replaceChildren();
+    if (!items.length) {
+      presetsEl.add(new Option('(no preset loaded)', '0'));
+    } else {
+      for (const [idx, name] of items) presetsEl.add(new Option(idx + ': ' + name, idx));
+      const wanted = keep !== null ? keep : String(selected);
+      presetsEl.value = wanted;
+      if (!presetsEl.value) presetsEl.value = '0';
+      selected = +presetsEl.value;
+    }
+  });
+
+  presetsEl.onchange = () => {
+    selected = +presetsEl.value || 0;
+    vibe.send(msg(new Uint8Array([0x21]), le32(selected)));
+    if (presetParam) vibe.set(presetParam.i, selected);
+  };
+  $('audition').onclick = () => vibe.send(new Uint8Array([0x23, 60]));
+  $('alloff').onclick = () => vibe.send(new Uint8Array([0x22]));
+  $('refresh').onclick = () => vibe.send(new Uint8Array([0x20]));
+  $('load').onclick = () => {
+    const path = $('path').value.trim();
+    if (!path) return;
+    statusEl.textContent = 'loading ' + path;
+    /* The device FILES page loads media. The Editor can ask it to load a path
+       by writing it into the firmware's upload name slot as a media request. */
+    vibe.send(msg(new Uint8Array([0x30]), enc.encode(path)));
+  };
+
+  const busy = /loader busy|loading |uploading|parsing|wait for the font switch/i;
+  async function waitForIdle(timeout = 20000) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      vibe.send(new Uint8Array([0x20]));
+      await new Promise((r) => setTimeout(r, 150));
+      if (!busy.test(lastStatus)) return;
+    }
+    throw new Error('firmware stayed busy: ' + (lastStatus || 'no status'));
+  }
+
+  async function upload(file) {
+    if (!/\.sf2$/i.test(file.name)) throw new Error(file.name + ': not an .sf2 file');
+    if (file.size > 16 * 1024 * 1024) throw new Error(file.name + ': too large (16 MB max)');
+    const data = new Uint8Array(await file.arrayBuffer());
+    const nameBytes = enc.encode(file.name).subarray(0, 127);
+    const head = msg(new Uint8Array([0x10]), le32(data.length),
+                     new Uint8Array([nameBytes.length]), nameBytes);
+    vibe.send(head);
+    const step = 2048;
+    for (let off = 0; off < data.length; off += step) {
+      const part = data.subarray(off, Math.min(off + step, data.length));
+      vibe.send(msg(new Uint8Array([0x11]), le32(off), part));
+      progressEl.textContent = file.name + ': ' +
+        Math.round(Math.min(100, (off + part.length) * 100 / data.length)) + '%';
+      if ((off / step) % 8 === 7) await new Promise((r) => setTimeout(r, 0));
+    }
+    lastStatus = 'parsing uploaded font';
+    vibe.send(new Uint8Array([0x12]));
+    await waitForIdle();
+    progressEl.textContent = file.name + ': loaded';
+  }
+
+  $('font').onchange = async () => {
+    const file = $('font').files && $('font').files[0];
+    if (!file) return;
+    try { await upload(file); }
+    catch (err) { statusEl.textContent = String(err && err.message || err); }
+  };
+
+  vibe.send(new Uint8Array([0x20]));
+})();
+</script>
+</body>
+</html>

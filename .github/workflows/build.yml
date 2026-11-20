@@ -1,0 +1,45 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Install Zig 0.13.0
+        shell: bash
+        run: |
+          curl -fsSLo zig.tar.xz https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+          tar -xf zig.tar.xz
+          echo "$GITHUB_WORKSPACE/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+
+      - name: Fetch Vibe SDK
+        shell: bash
+        run: sh scripts/fetch-sdk.sh
+
+      - name: Build firmware
+        shell: bash
+        run: sh sdk/tools/build.sh ../firmware/sf2-player
+
+      - name: Validate firmware
+        shell: bash
+        run: node sdk/tools/vibe-check.mjs sdk/build/sf2-player.wasm --manifest firmware/sf2-player/firmware.json --seconds 5
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sf2-player
+          path: |
+            sdk/build/sf2-player.zip
+            sdk/build/sf2-player.wasm
