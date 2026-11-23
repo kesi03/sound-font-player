@@ -20,6 +20,21 @@ browse fonts on host media, or upload one from the custom Editor page. It uses
   - Hold ENTER or DATA to turn on FOCUS; DATA then walks the on-screen controls.
 - Editor page with `.sf2` upload, a preset dropdown, media-path loading and audition buttons.
 - Twelve automatable parameters: `preset`, `volume`, `octave`, `transpose` and eight master FX controls.
+- A 960 × 540 **stage**: a second, bigger picture in the plugin and Playground – a large preset browser,
+  volume/octave/transpose sliders, master FX readouts, stereo meters and a live 25-key strip.
+
+## Stage
+
+Hosts with SDK 23 support open the stage in place of the device (`VIBE_STAGE_REPLACES`; press Esc / STAGE
+to see the device again). Click or drag a preset row, drag a slider, or use the mouse wheel to step
+presets – every element names the base control it stands for (encoder 1–4, F1/F2, DATA, the CTRL knobs).
+The stage is only a view: the 480 × 320 display, keys, pads and encoders still do everything, and the
+firmware sounds exactly the same when no host ever shows the stage.
+
+The stage framebuffer lives in `firmware/sf2-player/main.c` (`vibe_stage` in `vibe_on_init`,
+`vibe_on_stage` for drawing); `"stage": {"w": 960, "h": 540}` in `firmware.json` tells the host its size.
+Stereo peak levels come from the audio flow through two single-writer values; nothing time-critical
+runs in the stage callback.
 
 ## Master effects
 

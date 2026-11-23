@@ -50,9 +50,25 @@ enum {
 #define C_RED    0xFF6B6B
 #define C_BLUE   0x5AB6FF
 
+/* Standard-editor mapping: the master rack lives on its own FX tab, split
+ * into cards in signal order. Parameter ids are unchanged. */
 static const char *const GROUPS[] = {
-  "SOUND", "SOUND", "SOUND", "SOUND",
-  "FX", "FX", "FX", "FX", "FX", "FX", "FX", "FX"
+  "SOUND · VOICE", "SOUND · VOICE", "SOUND · VOICE", "SOUND · VOICE",
+  "FX · DRIVE",
+  "FX · CHORUS",
+  "FX · DELAY", "FX · DELAY",
+  "FX · REVERB", "FX · REVERB",
+  "FX · TREMOLO",
+  "FX · TONE"
+};
+static const vibe_card CARDS[] = {
+  { "VOICE",   6, "Preset, volume, octave and transpose." },
+  { "DRIVE",   4, "Pre-gain into the final soft clipper." },
+  { "CHORUS",  4, "Two LFO-modulated stereo delay taps." },
+  { "DELAY",   6, "375 ms ping-pong echo and its feedback." },
+  { "REVERB",  6, "Stereo room reverb: wet level and decay." },
+  { "TREMOLO", 4, "LFO amplitude modulation, slightly offset L / R." },
+  { "TONE",    4, "Master low-pass cutoff (1 = open)." }
 };
 static const vibe_param PARAMS[] = {
   { "preset", "Preset", 0.0f, 255.0f, 0.0f, "", 0, 0 },
@@ -85,6 +101,7 @@ static const char *const HELP[] = {
   "FX 1", "drive / chorus / delay / feedback", "FX 2", "reverb / decay / tremolo / tone",
   "HOLD ENTER", "turn on FOCUS, DATA walks controls", "RETURN", "back / FOCUS off",
   "HOME", "this overview", "EDITOR", "upload .sf2 and pick a preset",
+  "STAGE", "big preset list / sliders / meters - the device does it all too",
   "SPEED", "two static 16 MB font banks"
 };
 
@@ -141,6 +158,14 @@ typedef struct { int note; float env, vel, phase; uint8_t on; } demo_voice;
 static demo_voice demo[SF_DEMO_VOICES];
 static int cur_bank, cur_preset, cur_vol = -1;
 static int audition_left, audition_note = 60;
+
+/* ---- stage (SDK 23): a second, bigger picture, drawn in the drawing flow --- */
+#define SW 960
+#define SH 540
+static uint16_t stage_fb[SW * SH];
+static volatile float s_level_l, s_level_r;   /* written by audio, read by the stage */
+static int s_drag = -1, s_top_preset;
+static uint8_t stage_notes[128];              /* sounding notes, control flow only */
 
 static void work(void);
 static void ed_queue_status(void);
@@ -227,6 +252,23 @@ static void buf_copy(uint8_t *dst, const uint8_t *src, int n)
 {
   int i;
   for (i = 0; i < n; i++) dst[i] = src[i];
+}
+
+/* Long font / preset / file names must never run into the next widget. */
+static void fit_text(char *d, int cap, const char *s, int font, int maxw)
+{
+  char one[2] = { 0, 0 };
+  int n = 0, i, width = 0;
+  if (!s) s = "";
+  while (s[n] && n < cap - 1) { d[n] = s[n]; n++; }
+  d[n] = 0;
+  for (i = 0; i < n; i++) { one[0] = d[i]; width += vg_text_width(one, font); }
+  while (n > 0 && width > maxw) {
+    n--;
+    one[0] = d[n];
+    width -= vg_text_width(one, font);
+    d[n] = 0;
+  }
 }
 
 static uint32_t le32(const uint8_t *p)
@@ -432,7 +474,9 @@ static void audition(void)
 
 static void all_off(void)
 {
+  int i;
   queue_msg(MSG_ALL, 0, 0);
+  for (i = 0; i < 128; i++) stage_notes[i] = 0;
   scpy(status, "all notes off", sizeof status);
 }
 
@@ -981,6 +1025,74 @@ static void handle_focus_press(int id)
   }
 }
 
+enum { SD_NONE = -1, SD_PRESET = 1, SD_VOLUME, SD_OCTAVE, SD_TRANSPOSE };
+
+static void stage_fit_preset(int rows)
+{
+  if (npresets <= 0) { s_top_preset = 0; return; }
+  if (s_top_preset > npresets - rows) s_top_preset = npresets - rows;
+  if (s_top_preset < 0) s_top_preset = 0;
+  if (sel_preset < s_top_preset) s_top_preset = sel_preset;
+  if (sel_preset >= s_top_preset + rows) s_top_preset = sel_preset - rows + 1;
+}
+
+static void stage_set_slider(int drag, int x)
+{
+  float t = (float)(x - 520) / 400.0f;
+  if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+  if (drag == SD_VOLUME) {
+    float v = t * 2.0f;
+    vibe_param_set(P_VOLUME, v);
+    apply_param(P_VOLUME, v);
+  } else if (drag == SD_OCTAVE) {
+    int n = (int)(t * 4.0f - 2.0f + 0.5f);
+    if (n < -2) n = -2; if (n > 2) n = 2;
+    vibe_param_set(P_OCTAVE, (float)n);
+    apply_param(P_OCTAVE, (float)n);
+  } else if (drag == SD_TRANSPOSE) {
+    int n = (int)(t * 48.0f - 24.0f + 0.5f);
+    if (n < -24) n = -24; if (n > 24) n = 24;
+    vibe_param_set(P_TRANSPOSE, (float)n);
+    apply_param(P_TRANSPOSE, (float)n);
+  }
+}
+
+static int stage_hit(int x, int y)
+{
+  if (npresets > 0 && x >= 20 && x < 480 && y >= 100 && y < 460) return SD_PRESET;
+  if (x >= 500 && x <= 940) {
+    if (y >= 248 && y <= 292) return SD_VOLUME;
+    if (y >= 314 && y <= 358) return SD_OCTAVE;
+    if (y >= 380 && y <= 424) return SD_TRANSPOSE;
+  }
+  return SD_NONE;
+}
+
+static void stage_preset_at(int y)
+{
+  int row = (y - 100) / 30;
+  if (row < 0) row = 0;
+  if (row >= 12) row = 11;
+  if (npresets > 0) select_preset(s_top_preset + row);
+}
+
+static void handle_stage(const vibe_event *e)
+{
+  int x = VIBE_STAGE_X(e), y = VIBE_STAGE_Y(e);
+  if (e->id == VIBE_STAGE_DOWN) {
+    s_drag = stage_hit(x, y);
+    if (s_drag == SD_PRESET) stage_preset_at(y);
+    else if (s_drag != SD_NONE) stage_set_slider(s_drag, x);
+  } else if (e->id == VIBE_STAGE_MOVE) {
+    if (s_drag == SD_PRESET) stage_preset_at(y);
+    else if (s_drag != SD_NONE) stage_set_slider(s_drag, x);
+  } else if (e->id == VIBE_STAGE_UP) {
+    s_drag = SD_NONE;
+  } else if (e->id == VIBE_STAGE_WHEEL) {
+    move_sel(e->value > 0 ? -1 : 1);   /* the wheel has no coordinates: it steps presets (encoder 1) */
+  }
+}
+
 void vibe_on_event(const vibe_event *e)
 {
   int fid = -1;
@@ -988,10 +1100,12 @@ void vibe_on_event(const vibe_event *e)
   if (fr == VF_PRESS) { handle_focus_press(fid); return; }
   if (fr != VF_NO) return;
 
+  if (e->type == VIBE_EV_STAGE) { handle_stage(e); return; }
   if (e->type == VIBE_EV_NOTE) {
     int note = e->id + g_transpose_i;
     if (note < 0) note = 0;
     if (note > 127) note = 127;
+    stage_notes[note] = e->down ? 1 : 0;
     if (e->down) queue_msg(MSG_ON, note, (int)(e->value * 127.0f + 0.5f));
     else queue_msg(MSG_OFF, note, 0);
     return;
@@ -1202,9 +1316,18 @@ void vibe_on_audio(const float *in, float *out_l, float *out_r, int frames)
   }
 
   fx_process(out_l, out_r, frames, fxv);
-  for (i = 0; i < frames; i++) {
-    out_l[i] = output_sample(out_l[i]);
-    out_r[i] = output_sample(out_r[i]);
+  {
+    float ml = s_level_l, mr = s_level_r;
+    for (i = 0; i < frames; i++) {
+      float ll = output_sample(out_l[i]);
+      float rr = output_sample(out_r[i]);
+      float al = ll < 0.0f ? -ll : ll;
+      float ar = rr < 0.0f ? -rr : rr;
+      out_l[i] = ll; out_r[i] = rr;
+      ml = al > ml ? al : ml * 0.9995f;
+      mr = ar > mr ? ar : mr * 0.9995f;
+    }
+    s_level_l = ml; s_level_r = mr;
   }
 }
 
@@ -1247,9 +1370,8 @@ static void draw_knob(int row, int id, const char *label, const char *value)
 
 static void draw_sound_page(void)
 {
-  char t[32];
+  char t[64];
   int i;
-  vg_text(font_name[0] ? font_name : "DEMO VOICE", 366, 12, VG_BOLD, C_ACC, VG_RIGHT);
   vg_text("PRESETS", 12, 42, VG_BOLD, C_MUTED, VG_LEFT);
   vg_text("PREV", 200, 42, VG_SMALL, C_ACC, VG_CENTER);
   vg_text("NEXT", 250, 42, VG_SMALL, C_ACC, VG_CENTER);
@@ -1266,27 +1388,34 @@ static void draw_sound_page(void)
     if (idx >= npresets) break;
     if (idx == sel_preset) vg_round(8, y, 276, 24, 4, C_ACC);
     vg_text(vg_itoa(idx, t), 16, y + 4, VG_SMALL, idx == sel_preset ? C_BG : C_DIM, VG_LEFT);
-    vg_text(preset_names[idx], 52, y + 3, VG_MED, idx == sel_preset ? C_BG : C_FG, VG_LEFT);
+    fit_text(t, sizeof t, preset_names[idx], VG_MED, 222);
+    vg_text(t, 52, y + 3, VG_MED, idx == sel_preset ? C_BG : C_FG, VG_LEFT);
     vf_button(100 + i, 8, y, 276, 24);
   }
   if (npresets == 0) vg_text("no .sf2 loaded - keys play a demo voice", 16, 90, VG_SMALL, C_GREEN, VG_LEFT);
 
   vg_round(292, 40, 180, 38, 5, C_PANEL);
   vg_text("SELECTED", 302, 44, VG_SMALL, C_MUTED, VG_LEFT);
-  vg_text(npresets ? preset_names[sel_preset] : "DEMO", 302, 58, VG_BIG, C_ACC, VG_LEFT);
+  fit_text(t, sizeof t, npresets ? preset_names[sel_preset] : "DEMO", VG_BIG, 158);
+  vg_text(t, 302, 58, VG_BIG, C_ACC, VG_LEFT);
 
   draw_knob(0, P_PRESET, "PRESET", npresets ? vg_itoa(sel_preset, t) : "-");
   draw_knob(1, P_VOLUME, "VOLUME", vg_ftoa(vibe_param_get(P_VOLUME), 2, t));
   draw_knob(2, P_OCTAVE, "OCTAVE", vg_itoa(g_octave_i, t));
   draw_knob(3, P_TRANSPOSE, "TRANSPOSE", vg_itoa(g_transpose_i, t));
   vg_text(vg_itoa(npresets, t), 470, 44, VG_SMALL, C_MUTED, VG_RIGHT);
+  vg_text("FONT", 12, 274, VG_SMALL, C_DIM, VG_LEFT);
+  fit_text(t, sizeof t, font_name[0] ? font_name : "DEMO VOICE", VG_SMALL, 410);
+  vg_text(t, 48, 274, VG_SMALL, C_MUTED, VG_LEFT);
   draw_softkeys((const char *const[]){ "PREV", "NEXT", "AUDIT", "FILES", "HELP", "ALL OFF" });
 }
 
 static void draw_files_page(void)
 {
+  char t[128];
   int i;
-  vg_text(cur_dir[0] ? cur_dir : "MEDIA SOURCES", 12, 40, VG_MED, C_ACC, VG_LEFT);
+  fit_text(t, sizeof t, cur_dir[0] ? cur_dir : "MEDIA SOURCES", VG_MED, 456);
+  vg_text(t, 12, 40, VG_MED, C_ACC, VG_LEFT);
   for (i = 0; i < SF_UI_ROWS; i++) {
     int idx = top_file + i;
     int y = 68 + i * 26;
@@ -1299,23 +1428,26 @@ static void draw_files_page(void)
       char b[128];
       scpy(b, nm, sizeof b);
       for (char *c = b; *c && *c != '\t'; c++) if (*c == '\t') *c = ' ';
-      vg_text(b, 58, y + 3, VG_MED, idx == sel_file ? C_BG : C_FG, VG_LEFT);
+      fit_text(t, sizeof t, b, VG_MED, 406);
+      vg_text(t, 58, y + 3, VG_MED, idx == sel_file ? C_BG : C_FG, VG_LEFT);
     }
     vf_button(200 + i, 8, y, 464, 24);
   }
   if (nentries == 0) vg_text("no media here - use the Editor to upload .sf2 files", 16, 100, VG_SMALL, C_MUTED, VG_LEFT);
-  vg_text(status, 12, 282, VG_SMALL, C_GREEN, VG_LEFT);
+  fit_text(t, sizeof t, status, VG_SMALL, 456);
+  vg_text(t, 12, 274, VG_SMALL, C_GREEN, VG_LEFT);
   draw_softkeys((const char *const[]){ "BACK", "OPEN", "AUDIT", "SOUND", "HELP", "ALL OFF" });
 }
 
 static void draw_ctrl_page(void)
 {
-  char t[32];
+  char t[32], nm[64];
   int i;
   vg_text(ctrl_page == 0 ? "CONTROL" : "EFFECTS", 12, 42, VG_BOLD, C_MUTED, VG_LEFT);
   vg_round(8, 64, 464, 48, 6, C_PANEL);
   vg_text(ctrl_page == 0 ? "SOUNDFONT" : "MASTER CHAIN", 20, 70, VG_SMALL, C_MUTED, VG_LEFT);
-  vg_text(font_name[0] ? font_name : "(none - demo voice)", 20, 86, VG_BIG, C_ACC, VG_LEFT);
+  fit_text(nm, sizeof nm, font_name[0] ? font_name : "(none - demo voice)", VG_BIG, 440);
+  vg_text(nm, 20, 86, VG_BIG, C_ACC, VG_LEFT);
   t[0] = (char)('1' + ctrl_page); t[1] = '/'; t[2] = '3'; t[3] = 0;
   vg_text(t, 462, 74, VG_MED, C_FG, VG_RIGHT);
 
@@ -1329,9 +1461,100 @@ static void draw_ctrl_page(void)
     vg_text(value, 460, y + 5, VG_BIG, C_FG, VG_RIGHT);
     vf_encoder(VE_1 + i, 8, y, 464, 32);
   }
-  vg_text("F1 / F2 switch pages - knobs edit the four shown values", 12, 270, VG_SMALL, C_DIM, VG_LEFT);
-  vg_text(status, 12, 284, VG_SMALL, C_GREEN, VG_LEFT);
+  fit_text(t, sizeof t, status, VG_SMALL, 456);
+  vg_text(t, 12, 274, VG_SMALL, C_GREEN, VG_LEFT);
   draw_softkeys((const char *const[]){ "PAGE-", "PAGE+", "AUDIT", "SOUND", "HELP", "ALL OFF" });
+}
+
+/* ---- stage: the big picture (SDK 23) --------------------------------------- */
+
+static void st_slider(int y, const char *label, const char *value, float t)
+{
+  vg_round(500, y, 440, 44, 6, C_PANEL2);
+  vg_text(label, 512, y + 3, VG_SMALL, C_MUTED, VG_LEFT);
+  vg_text(value, 928, y + 1, VG_BIG, C_FG, VG_RIGHT);
+  vg_rect(516, y + 30, 408, 8, C_PANEL);
+  vg_rect(516, y + 30, (int)(408.0f * t), 8, C_ACC);
+}
+
+void vibe_on_stage(uint16_t *fb, int w, int h)
+{
+  char t[32], n[48], line[48];
+  float ml, mr;
+  int i;
+
+  (void)fb; (void)w; (void)h;   /* the host has called vg_begin_size(fb, w, h) */
+  stage_fit_preset(12);
+  vg_clear(C_BG);
+
+  vg_rect(0, 0, 960, 58, C_PANEL);
+  vg_text("SF2 PLAYER", 20, 14, VG_BIG, C_ACC, VG_LEFT);
+  vg_text("KEYS / PADS play the selected preset", 940, 20, VG_SMALL, C_MUTED, VG_RIGHT);
+
+  vg_text("PRESETS", 20, 70, VG_BOLD, C_MUTED, VG_LEFT);
+  vg_text("click / drag = PRESET   -   wheel = PRESET", 470, 72, VG_SMALL, C_DIM, VG_RIGHT);
+  for (i = 0; i < 12; i++) {
+    int idx = s_top_preset + i, y = 100 + i * 30;
+    if (idx >= npresets) break;
+    if (idx == sel_preset) vg_round(20, y, 460, 28, 4, C_ACC);
+    vg_text(vg_itoa(idx, t), 30, y + 6, VG_SMALL, idx == sel_preset ? C_BG : C_DIM, VG_LEFT);
+    fit_text(n, sizeof n, preset_names[idx], VG_MED, 390);
+    vg_text(n, 78, y + 5, VG_MED, idx == sel_preset ? C_BG : C_FG, VG_LEFT);
+  }
+  if (npresets == 0) vg_text("no .sf2 loaded - keys play a demo voice", 32, 120, VG_MED, C_GREEN, VG_LEFT);
+  if (npresets > 12) {
+    int th = 360 * 12 / npresets;
+    if (th < 20) th = 20;
+    vg_rect(488, 100, 8, 360, C_PANEL2);
+    vg_rect(488, 100 + (360 - th) * s_top_preset / (npresets - 12), 8, th, C_ACC);
+  }
+  fit_text(n, sizeof n, status, VG_SMALL, 900);
+  vg_text(n, 20, 466, VG_SMALL, C_GREEN, VG_LEFT);
+
+  vg_round(500, 70, 440, 150, 8, C_PANEL);
+  vg_text("SELECTED", 514, 80, VG_SMALL, C_MUTED, VG_LEFT);
+  fit_text(n, sizeof n, npresets ? preset_names[sel_preset] : "DEMO VOICE", VG_BIG, 310);
+  vg_text(n, 514, 104, VG_BIG, C_ACC, VG_LEFT);
+  fit_text(n, sizeof n, font_name[0] ? font_name : "(none - demo voice)", VG_SMALL, 412);
+  vg_text(n, 514, 136, VG_SMALL, C_FG, VG_LEFT);
+  vg_text(vg_itoa(sel_preset, t), 930, 100, VG_HUGE, C_FG, VG_RIGHT);
+  vg_text("PRESET  -  encoder 1 / F1 F2 / DATA", 514, 164, VG_SMALL, C_DIM, VG_LEFT);
+  scpy(line, "FX  D", sizeof line);
+  scat(line, vg_ftoa(vibe_param_get(P_DRIVE), 2, t), sizeof line);
+  scat(line, "  C", sizeof line);
+  scat(line, vg_ftoa(vibe_param_get(P_CHORUS), 2, t), sizeof line);
+  scat(line, "  R", sizeof line);
+  scat(line, vg_ftoa(vibe_param_get(P_REVERB), 2, t), sizeof line);
+  scat(line, "  T", sizeof line);
+  scat(line, vg_ftoa(vibe_param_get(P_TONE), 2, t), sizeof line);
+  vg_text(line, 514, 190, VG_SMALL, C_MUTED, VG_LEFT);
+  vg_text("all FX: CTRL pages 2 / 3, knobs 1-4", 514, 208, VG_SMALL, C_DIM, VG_LEFT);
+
+  st_slider(248, "VOLUME  -  ENCODER 2", vg_ftoa(vibe_param_get(P_VOLUME), 2, t),
+            vibe_param_get(P_VOLUME) * 0.5f);
+  st_slider(314, "OCTAVE  -  ENCODER 3", vg_itoa(g_octave_i, t), (g_octave_i + 2) / 4.0f);
+  st_slider(380, "TRANSPOSE  -  ENCODER 4", vg_itoa(g_transpose_i, t), (g_transpose_i + 24) / 48.0f);
+
+  ml = s_level_l; mr = s_level_r;
+  if (ml > 1.0f) ml = 1.0f;
+  if (mr > 1.0f) mr = 1.0f;
+  vg_text("L", 20, 474, VG_SMALL, C_MUTED, VG_LEFT);
+  vg_rect(40, 478, 900, 10, C_PANEL2);
+  vg_rect(40, 478, (int)(900.0f * ml), 10, C_GREEN);
+  vg_text("R", 20, 490, VG_SMALL, C_MUTED, VG_LEFT);
+  vg_rect(40, 494, 900, 10, C_PANEL2);
+  vg_rect(40, 494, (int)(900.0f * mr), 10, C_GREEN);
+
+  for (i = 0; i < 25; i++) {
+    int note = 36 + i, pc = note % 12, kx = 20 + i * 36;
+    int black = pc == 1 || pc == 3 || pc == 6 || pc == 8 || pc == 10;
+    int on = stage_notes[note];
+    vg_rect(kx, 508, 34, 28, on ? C_ACC : black ? C_PANEL2 : C_PANEL);
+    if (pc == 0) {
+      t[0] = (char)('0' + note / 12 - 1); t[1] = 0;
+      vg_text(t, kx + 3, 514, VG_SMALL, on ? C_BG : C_DIM, VG_LEFT);
+    }
+  }
 }
 
 void vibe_on_draw(uint16_t *fb)
@@ -1362,10 +1585,12 @@ void vibe_on_init(float sample_rate)
   sr = sample_rate > 0.0f ? sample_rate : 48000.0f;
   fx_init(sr);
   ctrl_page = 0;
+  vibe_stage(stage_fb, SW, SH, C_BG, VIBE_STAGE_REPLACES);
   vibe_notes(VIBE_NOTES | VIBE_NOTES_PADS | VIBE_NOTES_OWN_OCTAVE);
   vibe_keys_octave(2);
   vibe_params(PARAMS, P_COUNT);
   vibe_param_groups(GROUPS);
+  vibe_editor_cards(CARDS, (int)(sizeof CARDS / sizeof CARDS[0]));
   vibe_param_help(P_DRIVE, "Pre-gain into the final soft clipper (saturation).");
   vibe_param_help(P_CHORUS, "Wet level of the stereo modulated chorus.");
   vibe_param_help(P_DELAY, "Wet level of the 375 ms ping-pong echo.");
@@ -1375,6 +1600,8 @@ void vibe_on_init(float sample_rate)
   vibe_param_help(P_TREMOLO, "LFO amplitude depth (about 5.4 Hz).");
   vibe_param_help(P_TONE, "Master low-pass cutoff, 500 Hz to 18 kHz (1 = open).");
   vibe_editor_accent(C_ACC);
+  vibe_editor_tab_color("SOUND", C_ACC);
+  vibe_editor_tab_color("FX", C_BLUE);
   vibe_editor_control(P_PRESET, VIBE_CTL_MENU);
   vf_mode(VF_ON_HOLD);
   vf_clicks(1);
