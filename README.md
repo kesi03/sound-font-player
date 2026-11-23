@@ -1,5 +1,7 @@
 # SF2 PLAYER
 
+<img src="https://github.com/kesi03/sound-font-player/raw/master/firmware/sf2-player/icon.png" alt="drawing" style="width:200px;"/>
+
 A Vibe FM firmware that plays SoundFont 2 (`.sf2`) files. Pick an instrument from the device menu,
 browse fonts on host media, or upload one from the custom Editor page. It uses
 [TinySoundFont](https://github.com/schellingb/TinySoundFont) as the synthesis engine.
